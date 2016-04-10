@@ -1,4 +1,5 @@
 #include <avr/pgmspace.h>
+#include <avr/wdt.h>
 #include <CmdMessenger.h>
 #include <Streaming.h>
 #include <IRremote.h>
@@ -21,13 +22,16 @@ const unsigned short int TIMER1TOP = 340;
 const unsigned short int MAXPWM = (TIMER1TOP<<PWMSCALE);
 const unsigned short int MINPWM = (30<<PWMSCALE);
 
-const unsigned short int MAXRPM = (2150<<RPMSCALE);
+const unsigned short int MAXRPM = (2200<<RPMSCALE);
 const unsigned short int MINRPM = (400<<RPMSCALE);
 
 const signed short int INITIALTARGETTEMP = (35<<TEMPSCALE);
 const signed short int INITIALCURRENTTEMP = (20<<TEMPSCALE);
 
 const byte IRRECVPIN = 11;
+
+const byte RXPIN = A1;
+const byte TXPIN = A2;
 
 class IRCodeHandler {
   public:
@@ -76,6 +80,13 @@ unsigned long int lastTempUpdate = 0;
 signed short int currentTemp = INITIALCURRENTTEMP;
 signed short int tempTarget = INITIALTARGETTEMP;
 
+struct {
+  unsigned long int lastRecvTime;
+  char recvBuffer[32];
+  char *recvDestPtr;
+  byte nChars;
+} rxDataState;
+
 // Attach a new CmdMessenger object to the default Serial port
 CmdMessenger cmdMessenger = CmdMessenger(Serial, FIELDSEPARATOR, COMMANDSEPARATOR);
 
@@ -88,6 +99,7 @@ enum
   kERR           = 003, // Arduino reports badly formatted cmd, or cmd not recognised
   // Now we can define many more 'send' commands, coming from the arduino -> the PC, eg
   kRecvIRSig     = 004,
+  kRecvSSSig     = 005,
   // For the above commands, we just call cmdMessenger.sendCmd() anywhere we want in our Arduino program.
   kSEND_CMDS_END, // Mustnt delete this line
 };
@@ -97,9 +109,9 @@ enum
 // They start at the address kSEND_CMDS_END defined ^^ above as 004
 messengerCallbackFunction messengerCallbacks[] = 
 {
-  serialMessage,            // 005 in this example
-  currentTemperatureMessage,  // 006
-  sendIRCommandMessage,  // 007
+  serialMessage,            // 006 in this example
+  currentTemperatureMessage,  // 007
+  sendIRCommandMessage,  // 008
   NULL
 };
 // Its also possible (above ^^) to implement some symetric commands, when both the Arduino and
@@ -108,6 +120,8 @@ messengerCallbackFunction messengerCallbacks[] =
 
 void setup()
 {
+  wdt_enable(WDTO_2S);
+  
   // Set up TIMER0 for PWM controlling the fan
   TCCR1A = (1<<COM1A1) | (1<<COM1A0);
   TCCR1B = (1<<WGM13) | (1<<CS10);
@@ -153,6 +167,19 @@ void setup()
   pinMode(6, OUTPUT); // Power on/off relay
   digitalWrite(6, LOW);
 
+  pinMode(RXPIN, INPUT); // Software serial port Rx pin
+  pinMode(TXPIN, OUTPUT); // Software serial port Tx pin
+  digitalWrite(TXPIN, HIGH);
+
+  rxDataState.lastRecvTime = millis();
+  rxDataState.recvDestPtr = rxDataState.recvBuffer;
+  rxDataState.recvBuffer[0] = '\0';
+  rxDataState.recvBuffer[31] = '\0';
+  rxDataState.nChars = 0;
+  
+  setupSoftSerial();
+  setupSoftTx();
+
   attachInterrupt(0, rpmTick, RISING);
   OCR0A = 128;
   TIMSK0 |= (1<<OCIE0A);
@@ -179,6 +206,8 @@ void loop()
   static unsigned short int pwmVal = INITIALPWM;
   static unsigned short rpmTarget = INITIALRPM;
   static unsigned long int timeCalc;
+
+  wdt_reset();
 
   if(!irReceiverEnabled) { // If the reviever is turned off
     if(irTxDone()) {
@@ -257,7 +286,8 @@ void loop()
 
     if(millis() - lastTempUpdate > 2000) {
       lastTempUpdate = millis();
-      currentTemp += currentTemp <= (38 << TEMPSCALE) ? (1 << TEMPSCALE) : 0;
+      // currentTemp += currentTemp <= (50 << TEMPSCALE) ? (1.5 << TEMPSCALE) : 0;
+      currentTemp += currentTemp <= (50 << TEMPSCALE) ? (48) : 0;
       // It's been greater than two seconds since we got a message from the PC so we're probably in standalone mode
       standAloneMode = true;
     }
@@ -283,7 +313,7 @@ void loop()
     // Serial.print(" Integ error temp : ");
     // Serial.print(tempErrorInteg);
 
-    piRPM = errorTemp << 3; // + PTerm
+    piRPM = errorTemp << 2; // + PTerm
     // Serial.print(" PTerm : ");
     // Serial.print(piRPM);
     piRPM = piRPM + ((tempErrorInteg + 1) >> 1);
@@ -305,6 +335,25 @@ void loop()
     tempPIDUpdate = false;
   }
 
+  byte ssAvailable = softSerialAvailable();
+  if(ssAvailable) {
+    while(ssAvailable-- && (rxDataState.nChars < (sizeof(rxDataState.recvBuffer) - 1))) {
+      *rxDataState.recvDestPtr++ = softSerialRead();
+      rxDataState.nChars++;
+    }
+    rxDataState.lastRecvTime = millis();
+  }
+  
+  if(rxDataState.nChars > 0) {
+    if((rxDataState.nChars == (sizeof(rxDataState.recvBuffer) - 1)) || ((millis() - rxDataState.lastRecvTime) > 100)) {
+      rxDataState.recvBuffer[rxDataState.nChars]= '\0';
+      cmdMessenger.sendCmd(kRecvSSSig, rxDataState.recvBuffer);
+      rxDataState.recvDestPtr = rxDataState.recvBuffer;
+      rxDataState.recvBuffer[0] = '\0';
+      rxDataState.nChars = 0;
+    }
+  }
+
   // Process incoming serial data, if any
   cmdMessenger.feedinSerialData();
 }
@@ -314,12 +363,11 @@ void serialMessage()
 {
   // Message data is any ASCII bytes (0-255 value). But can't contain the field
   // separator, command separator chars you decide (eg ',' and ';')
-  cmdMessenger.sendCmd(kACK, "Serial message received.");
+  // cmdMessenger.sendCmd(kACK, "Serial message received.");
   while(cmdMessenger.available()) {
     char buf[50] = { '\0' };
     cmdMessenger.copyString(buf, sizeof(buf));
-    if(buf[0])
-      cmdMessenger.sendCmd(kACK, buf);
+    sendSerialString(buf);
   }
 }
 
@@ -367,7 +415,7 @@ void sendIRCommandMessage()
 
   // Message data is any ASCII bytes (0-255 value). But can't contain the field
   // separator, command separator chars you decide (eg ',' and ';')
-  cmdMessenger.sendCmd(kACK, "IR Command message message received");
+  // cmdMessenger.sendCmd(kACK, "IR Command message message received");
   while(cmdMessenger.available()) {
     char buf[50] = { '\0' };
     char *bufPtr = buf;
@@ -442,6 +490,18 @@ ISR(TIMER0_COMPA_vect)
 ISR(PCINT0_vect)
 {
   irrecv.servIRPinChange();
+}
+
+// Pin change handler for software serial port
+ISR(PCINT1_vect)
+{ 
+  srvSSStateChange();
+}
+
+// Timer tick for serial transmitter
+ISR(TIMER2_OVF_vect)
+{
+  srvTXTimer();
 }
 
 // ---------------- Utility functions --------------

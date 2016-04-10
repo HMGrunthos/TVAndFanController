@@ -85,45 +85,53 @@ void IRCodeHandler::handleKeyState(unsigned short int irValue, KeyStateType keyS
           break;
         }
       }
+      // 0x79C TV
+      // 0x79B Guide
+      // 0x78B Red
+      // 0x7AE Green
+      // 0x7B8 Yellow
+      // 0x7A9 Blue
+      // 0x78A *
+      // 0x78E #
       switch(irValue) { // Haven't processed the key yet do these in any mode
         case 0x7BD: // TV power
           disableIRInterrupts();
           decodeAndSendIRCommand(13);
           break;
-        case 0x79C: // TV Aspect
+        case 0x78B: // TV Aspect (Red)
           disableIRInterrupts();
           decodeAndSendIRCommand(29);
           break;
-        case 0x79B: // TV Input
+        case 0x7AE: // TV Input (Green)
           disableIRInterrupts();
           decodeAndSendIRCommand(3);
           break;
-        case 0x78B: // TV Multi PIP
-          disableIRInterrupts();
-          decodeAndSendIRCommand(32);
-          break;
-        case 0x7AE: // TV Swap
-          disableIRInterrupts();
-          decodeAndSendIRCommand(22);
-          break;
-        case 0x7B8: // TV Select
-          disableIRInterrupts();
-          decodeAndSendIRCommand(30);
-          break;
-        case 0x7A9: // TV Move/Zoom
-          disableIRInterrupts();
-          decodeAndSendIRCommand(23);
-          break;
-        case 0x78A: // TV Component input
+//        case 0x78B: // TV Multi PIP
+//          disableIRInterrupts();
+//          decodeAndSendIRCommand(32);
+//          break;
+//        case 0x7AE: // TV Swap
+//          disableIRInterrupts();
+//          decodeAndSendIRCommand(22);
+//          break;
+//        case 0x7B8: // TV Select
+//          disableIRInterrupts();
+//          decodeAndSendIRCommand(30);
+//          break;
+//        case 0x7A9: // TV Move/Zoom
+//          disableIRInterrupts();
+//          decodeAndSendIRCommand(23);
+//          break;
+        case 0x7B8: // TV Component input (Yellow)
           disableIRInterrupts();
           decodeAndSendIRCommand(24);
           break;
-        case 0x78E: // TV Digital input
+        case 0x7A9: // TV Digital input (Blue)
           disableIRInterrupts();
           decodeAndSendIRCommand(1);
           break;
         case 0x7BB: // PC power
-          if(nKeyPress == 2) { // Only on a double tap
+          if(nKeyPress == 3) { // Only on a double tap
             pulsePin(PCPOWERPIN);
           }
           break;
