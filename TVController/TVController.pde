@@ -1,3 +1,4 @@
+#include <avr/pgmspace.h>
 #include <CmdMessenger.h>
 #include <Streaming.h>
 
@@ -5,7 +6,7 @@
 const char FIELDSEPARATOR = ',';
 const char COMMANDSEPARATOR = ';';
 
-const unsigned char MASTERPIDCOUNTDOWN = 32; // about 15 Hz
+const unsigned char MASTERPIDCOUNTDOWN = 61; // about 16 Hz
 const unsigned char TEMPPIDCOUNTDOWN = 8; // about 2 Hz
 
 const unsigned short int PWMSCALE = 7;
@@ -15,7 +16,8 @@ const unsigned short int TEMPSCALE = 5;
 const unsigned short int INITIALPWM = (183<<PWMSCALE);
 const unsigned short int INITIALRPM = (1500<<RPMSCALE);
 
-const unsigned short int MAXPWM = (340<<PWMSCALE);
+const unsigned short int TIMER1TOP = 340;
+const unsigned short int MAXPWM = (TIMER1TOP<<PWMSCALE);
 const unsigned short int MINPWM = (30<<PWMSCALE);
 
 const unsigned short int MAXRPM = (2150<<RPMSCALE);
@@ -26,8 +28,8 @@ const signed short int INITIALCURRENTTEMP = (20<<TEMPSCALE);
 
 volatile unsigned char rpmCount;
 
-volatile unsigned char masterPIDCount;
-volatile unsigned char tempPIDCount;
+volatile byte masterPIDCount;
+volatile byte tempPIDCount;
 volatile boolean pwmPIDUpdate;
 volatile boolean tempPIDUpdate;
 
@@ -59,6 +61,7 @@ messengerCallbackFunction messengerCallbacks[] =
 {
   serialMessage,            // 004 in this example
   currentTemperatureMessage,  // 005
+  sendIRCommandMessage,  // 006
   NULL
 };
 // Its also possible (above ^^) to implement some symetric commands, when both the Arduino and
@@ -70,23 +73,25 @@ void setup()
   // Set up TIMER0 for PWM controlling the fan
   TCCR1A = (1<<COM1A1) | (1<<COM1A0);
   TCCR1B = (1<<WGM13) | (1<<CS10);
-  ICR1 = 340;
+  ICR1 = TIMER1TOP;
   OCR1A = INITIALPWM >> PWMSCALE;
-  DDRB |= (1<<DDB1);
+  pinMode(9, OUTPUT);
+  // DDRB |= (1<<DDB1);
 
   // RPM monitoring variable
   rpmCount = 0;
 
+  // Timer countdowns
   masterPIDCount = MASTERPIDCOUNTDOWN;
   pwmPIDUpdate = false;
   tempPIDCount = TEMPPIDCOUNTDOWN;
   tempPIDUpdate = false;
 
   Serial.begin(115200);
-  
+
   Serial.println("\n[memCheck]");
   Serial.println(freeRam());
-  
+
   cmdMessenger.print_LF_CR();   // Make output more readable whilst debugging in Arduino Serial Monitor
 
   // Attach default / generic callback methods
@@ -98,13 +103,13 @@ void setup()
   
   arduino_ready();
 
-  digitalWrite(3, LOW);
-  pinMode(3, OUTPUT);
+  setupIRTransmitter();
 
   pinMode(2, INPUT);
 
   attachInterrupt(0, rpmTick, RISING);
-  TIMSK2 |= (1<<TOIE2);
+  OCR0A = 128;
+  TIMSK0 |= (1<<OCIE0A);
 }
 
 void loop()
@@ -246,19 +251,8 @@ void currentTemperatureMessage()
     while(*bufPtr != '\0') {
       if(isdigit(*bufPtr)) {
         signed short int tempRead = 0;
-        unsigned char nDecPlaces = 0;
-        
-        while(isdigit(*bufPtr) || *bufPtr == '.') {
-          if(isdigit(*bufPtr)) {
-            tempRead = tempRead*10 + *bufPtr - 48;
-            nDecPlaces *= 10;
-          } else {
-            nDecPlaces = 1;
-          }
-          bufPtr++;
-        }
 
-        tempRead = (tempRead << TEMPSCALE) / (nDecPlaces==0?1:nDecPlaces);
+        tempRead = readDigits(bufPtr, TEMPSCALE);
 
         if(fieldNo == 0) {
           lastTempUpdate = millis();
@@ -268,6 +262,36 @@ void currentTemperatureMessage()
         }
 
         fieldNo++;
+
+        break;
+      }
+      bufPtr++;
+    }
+  }
+}
+
+void sendIRCommandMessage()
+{
+  unsigned char fieldNo = 0;
+
+  // Message data is any ASCII bytes (0-255 value). But can't contain the field
+  // separator, command separator chars you decide (eg ',' and ';')
+  cmdMessenger.sendCmd(kACK, "IR Command temperature message message received");
+  while(cmdMessenger.available()) {
+    char buf[50] = { '\0' };
+    char *bufPtr = buf;
+
+    cmdMessenger.copyString(buf, sizeof(buf));
+
+    while(*bufPtr != '\0') {
+      if(isdigit(*bufPtr)) {
+        signed short int commandRead = 0;
+
+        commandRead = readDigits(bufPtr, 0);
+
+        if(!decodeAndSendIRCommand(commandRead)) {
+          cmdMessenger.sendCmd(kERR, "Invalid IR command");
+        }
 
         break;
       }
@@ -304,13 +328,13 @@ void attach_callbacks(messengerCallbackFunction *callbacks)
 void rpmTick()
 {
   // Each rotation, this interrupt function is run twice
-  rpmCount++;
+ rpmCount++;
 }
 
-ISR(TIMER2_OVF_vect)
+ISR(TIMER0_COMPA_vect)
 {
-  // Ticks at about 490Hz
-  if(--masterPIDCount == 0) {
+  // Ticks at 976.56Hz by default
+  if(--masterPIDCount == 0) { // Will hit zero at 15Hz
     pwmPIDUpdate = true;
     masterPIDCount = MASTERPIDCOUNTDOWN;
     if(--tempPIDCount == 0) {
@@ -321,6 +345,26 @@ ISR(TIMER2_OVF_vect)
 }
 
 // ---------------- Utility functions --------------
+signed short int readDigits(char *bufPtr, byte fpScale)
+{
+  signed short int valRead = 0;
+  unsigned char nDecPlaces = 0;
+
+  while(isdigit(*bufPtr) || *bufPtr == '.') {
+    if(isdigit(*bufPtr)) {
+      valRead = valRead*10 + *bufPtr - 48;
+      nDecPlaces *= 10;
+    } else {
+      nDecPlaces = 1;
+    }
+    bufPtr++;
+  }
+  
+  valRead = (valRead << fpScale) / (nDecPlaces==0?1:nDecPlaces);
+
+  return valRead;
+}
+
 int freeRam () {
   extern int __heap_start, *__brkval; 
   int v; 
