@@ -1,6 +1,7 @@
 #include <avr/pgmspace.h>
 #include <CmdMessenger.h>
 #include <Streaming.h>
+#include <IRremote.h>
 
 // Must not conflict / collide with our message payload data. Fine if we use base64 library ^^ above
 const char FIELDSEPARATOR = ',';
@@ -26,6 +27,42 @@ const unsigned short int MINRPM = (400<<RPMSCALE);
 const signed short int INITIALTARGETTEMP = (35<<TEMPSCALE);
 const signed short int INITIALCURRENTTEMP = (20<<TEMPSCALE);
 
+const byte IRRECVPIN = 11;
+
+class IRCodeHandler {
+  public:
+    IRCodeHandler();
+    void updateKeyState();
+    void handleIRSignal(unsigned long long int irValue);
+  private:
+    enum KeyStateType {
+      PRESS,
+      DOWN,
+      UP
+    };
+  private:
+    const static unsigned long int IOPULSETIME = 100;
+    const static unsigned long int REPEATGUARD = 500;
+    const static unsigned long int KEYUPTIMEOUT = 300;
+    const static unsigned long int DBLTAPTIMEOUT = 600;
+  private:
+    byte currPulsePin;
+    unsigned short int nKeyPress;
+    unsigned long int pulsePinTimeOut;
+    unsigned long int lastIRCodeTime;
+    unsigned short int currentKeyDown;
+    unsigned long long int lastKeyCode;
+  private:
+    void pulsePin(byte pin);
+    void togglePin(byte pin);
+    void handleKeyState(unsigned short int irValue, KeyStateType keyState, unsigned short int nKeyPress);
+    boolean serveStandAloneOnlyPRESS(unsigned short int irValue);
+    boolean serveStandAloneOnlyDOWN(unsigned short int irValue);
+};
+
+IRrecvPinChangeSvr irrecv(IRRECVPIN);
+IRCodeHandler irCodeServer;
+
 volatile unsigned char rpmCount;
 
 volatile byte masterPIDCount;
@@ -33,6 +70,8 @@ volatile byte tempPIDCount;
 volatile boolean pwmPIDUpdate;
 volatile boolean tempPIDUpdate;
 
+boolean standAloneMode = true;
+boolean irReceiverEnabled = false;
 unsigned long int lastTempUpdate = 0;
 signed short int currentTemp = INITIALCURRENTTEMP;
 signed short int tempTarget = INITIALTARGETTEMP;
@@ -48,8 +87,7 @@ enum
   kARDUINO_READY = 002, // After opening the comm port, send this cmd 02 from PC to check arduino is ready
   kERR           = 003, // Arduino reports badly formatted cmd, or cmd not recognised
   // Now we can define many more 'send' commands, coming from the arduino -> the PC, eg
-  // kICE_CREAM_READY,
-  // kICE_CREAM_PRICE,
+  kRecvIRSig     = 004,
   // For the above commands, we just call cmdMessenger.sendCmd() anywhere we want in our Arduino program.
   kSEND_CMDS_END, // Mustnt delete this line
 };
@@ -59,9 +97,9 @@ enum
 // They start at the address kSEND_CMDS_END defined ^^ above as 004
 messengerCallbackFunction messengerCallbacks[] = 
 {
-  serialMessage,            // 004 in this example
-  currentTemperatureMessage,  // 005
-  sendIRCommandMessage,  // 006
+  serialMessage,            // 005 in this example
+  currentTemperatureMessage,  // 006
+  sendIRCommandMessage,  // 007
   NULL
 };
 // Its also possible (above ^^) to implement some symetric commands, when both the Arduino and
@@ -104,12 +142,35 @@ void setup()
   arduino_ready();
 
   setupIRTransmitter();
+  
+  irrecv.enableIRIn(); // Start the IR receiver
 
   pinMode(2, INPUT);
+
+  pinMode(13, OUTPUT); // LED
+  digitalWrite(13, LOW);
+
+  pinMode(6, OUTPUT); // Power on/off relay
+  digitalWrite(6, LOW);
 
   attachInterrupt(0, rpmTick, RISING);
   OCR0A = 128;
   TIMSK0 |= (1<<OCIE0A);
+
+  enableIRInterrupts();
+  PCICR |= (1<<PCIE0); // Attach the pin change interrupt
+}
+
+void enableIRInterrupts()
+{
+  PCMSK0 |= (1<<PCINT3); // Attach the pin change interrupt
+  irReceiverEnabled = true;
+}
+
+void disableIRInterrupts()
+{
+  PCMSK0 &= ~(1<<PCINT3); // Detach the pin change interrupt
+  irReceiverEnabled = false;
 }
 
 void loop()
@@ -119,10 +180,13 @@ void loop()
   static unsigned short rpmTarget = INITIALRPM;
   static unsigned long int timeCalc;
 
-  if (rpmCount >= 20 || ((millis() - timeCalc) > 3000)) {
-    if((millis() - timeCalc) > 3000) {
-      Serial.println("Speed too low");
+  if(!irReceiverEnabled) { // If the reviever is turned off
+    if(irTxDone()) {
+      enableIRInterrupts();
     }
+  }
+
+  if (rpmCount >= 20 || ((millis() - timeCalc) > 3000)) {
     static unsigned char rpmFilterIndex = 0;
     static unsigned short int rpmFilter[4] = {0, 0, 0, 0};
 
@@ -133,6 +197,12 @@ void loop()
     rpm -= rpmFilter[rpmFilterIndex%4];
     rpmFilter[rpmFilterIndex++%4] = localRPM;
     rpm += localRPM;
+
+    if(rpmCount < 20) {
+      Serial.println("Fan speed too low!");
+      rpmFilter[0] = rpmFilter[1] = rpmFilter[2] = rpmFilter[3] = localRPM;
+      rpm = localRPM << RPMSCALE; // Use unfiltered speed to get faster response
+    }
 
     rpmCount = 0;
     timeCalc = millis();
@@ -163,6 +233,22 @@ void loop()
     pwmPIDUpdate = false;
   }
 
+  if(irrecv.decode()) {
+    static unsigned long long int lastIRValue;
+
+    if(irrecv.results.decode_type == IRrecv::RC5) {
+      char buf[sizeof(unsigned long long int) * 2];
+
+      sprintHex64(buf, irrecv.results.value);
+      cmdMessenger.sendCmd(kRecvIRSig, buf);
+
+      irCodeServer.handleIRSignal(irrecv.results.value);
+    }
+    irrecv.resume(); // Receive the next value
+  }
+
+  irCodeServer.updateKeyState();
+
   if(tempPIDUpdate == true) {
     static signed long int tempErrorInteg = ((signed long int)INITIALRPM) << 1;
 
@@ -172,6 +258,8 @@ void loop()
     if(millis() - lastTempUpdate > 2000) {
       lastTempUpdate = millis();
       currentTemp += currentTemp <= (38 << TEMPSCALE) ? (1 << TEMPSCALE) : 0;
+      // It's been greater than two seconds since we got a message from the PC so we're probably in standalone mode
+      standAloneMode = true;
     }
 
     errorTemp = currentTemp - tempTarget;
@@ -190,19 +278,19 @@ void loop()
     Serial.print(" Current temp : ");
     Serial.println(currentTemp/(float)(1<<TEMPSCALE));
 
-    Serial.print("Error temp : ");
-    Serial.print(errorTemp);
-    Serial.print(" Integ error temp : ");
-    Serial.print(tempErrorInteg);
+    // Serial.print("Error temp : ");
+    // Serial.print(errorTemp);
+    // Serial.print(" Integ error temp : ");
+    // Serial.print(tempErrorInteg);
 
     piRPM = errorTemp << 3; // + PTerm
-    Serial.print(" PTerm : ");
-    Serial.print(piRPM);
+    // Serial.print(" PTerm : ");
+    // Serial.print(piRPM);
     piRPM = piRPM + ((tempErrorInteg + 1) >> 1);
-    Serial.print(" ITerm : ");
-    Serial.print(((tempErrorInteg + 4) >> 1));
-    Serial.print(" Total : ");
-    Serial.println(piRPM);
+    // Serial.print(" ITerm : ");
+    // Serial.print(((tempErrorInteg + 4) >> 1));
+    // Serial.print(" Total : ");
+    // Serial.println(piRPM);
 
     if(piRPM < MINRPM) {
       piRPM = MINRPM;
@@ -216,7 +304,7 @@ void loop()
 
     tempPIDUpdate = false;
   }
-  
+
   // Process incoming serial data, if any
   cmdMessenger.feedinSerialData();
 }
@@ -267,6 +355,9 @@ void currentTemperatureMessage()
       }
       bufPtr++;
     }
+
+    // We got a temperature reading from the PC so we're not in standalone mode
+    standAloneMode = false;
   }
 }
 
@@ -276,7 +367,7 @@ void sendIRCommandMessage()
 
   // Message data is any ASCII bytes (0-255 value). But can't contain the field
   // separator, command separator chars you decide (eg ',' and ';')
-  cmdMessenger.sendCmd(kACK, "IR Command temperature message message received");
+  cmdMessenger.sendCmd(kACK, "IR Command message message received");
   while(cmdMessenger.available()) {
     char buf[50] = { '\0' };
     char *bufPtr = buf;
@@ -288,6 +379,8 @@ void sendIRCommandMessage()
         signed short int commandRead = 0;
 
         commandRead = readDigits(bufPtr, 0);
+
+        disableIRInterrupts();
 
         if(!decodeAndSendIRCommand(commandRead)) {
           cmdMessenger.sendCmd(kERR, "Invalid IR command");
@@ -331,6 +424,7 @@ void rpmTick()
  rpmCount++;
 }
 
+// Time the PID loops
 ISR(TIMER0_COMPA_vect)
 {
   // Ticks at 976.56Hz by default
@@ -342,6 +436,12 @@ ISR(TIMER0_COMPA_vect)
       tempPIDCount = TEMPPIDCOUNTDOWN;
     }
   }
+}
+
+// Pin change interrupt for IR reception
+ISR(PCINT0_vect)
+{
+  irrecv.servIRPinChange();
 }
 
 // ---------------- Utility functions --------------
@@ -369,4 +469,26 @@ int freeRam () {
   extern int __heap_start, *__brkval; 
   int v; 
   return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval); 
+}
+
+// based on Print::printNumber
+void sprintHex64(char *buf, unsigned long long n)
+{
+  unsigned long i = 0;
+
+  if (n == 0) {
+    *buf++ = '0';
+    *buf++ = '\0';
+    return;
+  } 
+
+  while (n > 0) {
+    buf[i++] = n & 0xf;
+    n >>= 4;
+  }
+
+  buf[i] = '\0';
+  for (; i > 0; i--) {
+    buf[i - 1] = buf[i - 1] < 10 ? '0' + buf[i - 1] : 'A' + buf[i - 1] - 10;
+  }
 }
